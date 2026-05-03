@@ -1,14 +1,20 @@
 //! Bench: Fine Food embeddings CSV — compression, disk size, Recall@k (bits 2 & 4), timings.
+//!
+//! Stderr ( **`bits=4`** path, same protocol as [`glove_angular_bench`]): **`tq_ms_per_query`**, optional **`faiss_ms_per_query`**, then exact-vs-TurboQuant recall block. **`--no-faiss`** skips Python FAISS. JSON on stdout is unchanged.
 
 use std::path::PathBuf;
-use std::time::Instant;
 
 use ndarray::{Array2, ArrayView2, Axis};
+use ndarray_npy::write_npy;
 use serde::Serialize;
 
 use turboquant_index::csv_dataset::{self, FINE_FOOD_EMBEDDING_DIM};
 use turboquant_index::index::{SearchConfig, SearchObjective};
 use turboquant_index::packing::packed_row_bytes;
+use turboquant_index::recall_report::report_recall_for_index;
+use turboquant_index::latency::{
+    eprint_if_turboquant_slower_than_faiss, median_tq_ms_per_query, try_faiss_median_ms,
+};
 use turboquant_index::simd::Scorer;
 use turboquant_index::TurboQuantIndex;
 
@@ -37,6 +43,17 @@ struct BytesBreakdown {
 struct ReferenceSearchBench {
     /// Exact cosine top‑`k`: full linear scan over **dense fp32 DB** (`n_db × dim` dot-products per query).
     brute_dense_cosine_topk_batch_ms: f64,
+}
+
+/// Same protocol as [`glove_angular_bench`] / `benchmarks/faiss_npy_time.py`: warmup + median over `timed_runs` batch searches, `RAYON_NUM_THREADS=1`, bits=4 TurboQuant vs FAISS PQ FastScan.
+#[derive(Clone, Serialize)]
+struct ReferenceLatencyMs {
+    timed_runs: usize,
+    tq_ms_per_query: f64,
+    faiss_ms_per_query: Option<f64>,
+    faiss_pq_backend: Option<String>,
+    /// Set when FAISS was not run (`--no-faiss`) or the subprocess failed (see message).
+    faiss_skipped_reason: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -86,6 +103,8 @@ struct FoodBenchReport {
     split: SplitInfo,
     notes: &'static str,
     reference_search: ReferenceSearchBench,
+    /// TurboQuant vs FAISS median ms/query (also echoed on stderr).
+    reference_latency_ms_per_query: ReferenceLatencyMs,
     configs: Vec<BitConfigReport>,
 }
 
@@ -120,7 +139,7 @@ fn brute_topk_cosine(db: ArrayView2<f32>, q: &[f32], k: usize) -> Vec<usize> {
 
 /// Wall time to run exact brute cosine top‑`k` for **all** query rows (baseline for search latency).
 fn benchmark_brute_dense_batch(db: &Array2<f32>, queries: &Array2<f32>, k: usize) -> f64 {
-    let t = Instant::now();
+    let t = std::time::Instant::now();
     for qi in 0..queries.nrows() {
         let qrow_own = queries.index_axis(Axis(0), qi).into_owned();
         let qslice = qrow_own.as_slice().unwrap();
@@ -222,11 +241,11 @@ fn run_bits_config(
     k: usize,
     bytes_dense_db: u64,
     brute_dense_batch_ms: f64,
-) -> Result<BitConfigReport, Box<dyn std::error::Error>> {
+) -> Result<(BitConfigReport, TurboQuantIndex), Box<dyn std::error::Error>> {
     let n_db = db.nrows();
     let dim = DIM;
 
-    let t_build = Instant::now();
+    let t_build = std::time::Instant::now();
     let mut idx =
         TurboQuantIndex::with_lloyd_iterations(dim, bits, index_seed, lloyd_iters);
     idx.add_vectors(db.view());
@@ -252,7 +271,7 @@ fn run_bits_config(
         scorer: Scorer::Wide,
     };
 
-    let t_search_w = Instant::now();
+    let t_search_w = std::time::Instant::now();
     let approx = idx.search_topk_indices(queries.view(), k, cfg_wide);
     let wide_ms = t_search_w.elapsed().as_secs_f64() * 1000.0;
 
@@ -260,7 +279,7 @@ fn run_bits_config(
         objective: SearchObjective::Cosine,
         scorer: Scorer::Scalar,
     };
-    let t_search_s = Instant::now();
+    let t_search_s = std::time::Instant::now();
     let _approx_s = idx.search_topk_indices(queries.view(), k, cfg_scalar);
     let scalar_ms = t_search_s.elapsed().as_secs_f64() * 1000.0;
 
@@ -282,7 +301,7 @@ fn run_bits_config(
     let speedup_wide = brute_dense_batch_ms / wide_ms.max(eps_ms);
     let speedup_scalar = brute_dense_batch_ms / scalar_ms.max(eps_ms);
 
-    Ok(BitConfigReport {
+    let report = BitConfigReport {
         bits,
         index_seed,
         lloyd_iterations: lloyd_iters,
@@ -312,23 +331,28 @@ fn run_bits_config(
             min,
         },
         scorer_wide: "Wide",
-    })
+    };
+    Ok((report, idx))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
+    std::env::set_var("RAYON_NUM_THREADS", "1");
 
-    // Args: [bin] [csv_path] [k] [train_fraction] [split_seed] [index_seed] [lloyd_iters]
+    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+    let skip_faiss = raw.iter().any(|s| s == "--no-faiss");
+    raw.retain(|s| s != "--no-faiss");
+    let positional: Vec<String> = raw.into_iter().filter(|s| !s.starts_with('-')).collect();
+
     let csv_path = PathBuf::from(arg_string(
-        &args,
-        1,
+        &positional,
+        0,
         "fine_food_reviews_with_embeddings_1k.csv",
     ));
-    let k = arg_usize(&args, 2, 10);
-    let train_fraction = arg_f64(&args, 3, 0.85);
-    let split_seed = arg_u64(&args, 4, 42);
-    let index_seed = arg_u64(&args, 5, 99);
-    let lloyd_iters = arg_usize(&args, 6, 80);
+    let k = arg_usize(&positional, 1, 10);
+    let train_fraction = arg_f64(&positional, 2, 0.85);
+    let split_seed = arg_u64(&positional, 3, 42);
+    let index_seed = arg_u64(&positional, 4, 99);
+    let lloyd_iters = arg_usize(&positional, 5, 80);
 
     if k < 1 {
         return Err("k must be >= 1".into());
@@ -349,6 +373,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    const REFERENCE_N_DB: usize = 100_000;
+    if n_db < REFERENCE_N_DB {
+        eprintln!(
+            "note: Fine Food split uses n_db={n_db} (GloVe reference speed scripts use ~{REFERENCE_N_DB} train rows); \
+             FAISS vs TQ ordering here is for matched protocol, not the large-corpus regime."
+        );
+    }
+
     let db = csv_dataset::gather_rows(embeddings.view(), &db_ix);
     let queries = csv_dataset::gather_rows(embeddings.view(), &q_ix);
     drop(embeddings);
@@ -358,8 +390,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let brute_batch_ms = benchmark_brute_dense_batch(&db, &queries, k);
 
     let mut configs = Vec::new();
+    let mut idx4_opt: Option<TurboQuantIndex> = None;
     for &bits in &[2u8, 4u8] {
-        configs.push(run_bits_config(
+        let (rep, idx) = run_bits_config(
             bits,
             index_seed,
             lloyd_iters,
@@ -368,8 +401,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             k,
             bytes_dense_db,
             brute_batch_ms,
-        )?);
+        )?;
+        configs.push(rep);
+        if bits == 4 {
+            idx4_opt = Some(idx);
+        }
     }
+
+    let idx4 = idx4_opt.expect("4-bit config");
+    let label = format!(
+        "{} ({}×{} train, {}×{} query, angular, bits=4 latency below)",
+        csv_path.display(),
+        n_db,
+        DIM,
+        n_q,
+        DIM,
+    );
+
+    let timed_runs = 5usize;
+    let tq_ms = median_tq_ms_per_query(&idx4, queries.view(), k, n_q, timed_runs);
+
+    let mut faiss_ms: Option<f64> = None;
+    let mut faiss_backend: Option<String> = None;
+    let mut faiss_skipped_reason: Option<String> = None;
+
+    eprintln!(
+        "speed_median_ms_per_query (warmup + {timed_runs} timed runs, RAYON_NUM_THREADS=1): tq_ms_per_query={tq_ms:.4}  (bits=4)",
+    );
+    if !skip_faiss {
+        let pid = std::process::id();
+        let train_npy = std::env::temp_dir().join(format!("turboquant_food_{pid}_train.npy"));
+        let test_npy = std::env::temp_dir().join(format!("turboquant_food_{pid}_test.npy"));
+        write_npy(&train_npy, &db)?;
+        write_npy(&test_npy, &queries)?;
+        match try_faiss_median_ms(&train_npy, &test_npy, k, 4, timed_runs) {
+            Ok(f) => {
+                faiss_ms = Some(f.faiss_ms_per_query);
+                faiss_backend = Some(f.faiss_pq_backend.clone());
+                eprintln!(
+                    "faiss_ms_per_query={:.4}  backend={}  (same protocol as benchmarks/benchmark_speed_glove200.py)",
+                    f.faiss_ms_per_query,
+                    f.faiss_pq_backend,
+                );
+                eprint_if_turboquant_slower_than_faiss(tq_ms, f.faiss_ms_per_query);
+            }
+            Err(e) => {
+                faiss_skipped_reason = Some(e.clone());
+                eprintln!("faiss_ms_per_query=(skipped)  reason: {e}");
+            }
+        }
+        let _ = std::fs::remove_file(&train_npy);
+        let _ = std::fs::remove_file(&test_npy);
+    } else {
+        faiss_skipped_reason = Some("--no-faiss".to_string());
+        eprintln!("faiss_ms_per_query=(skipped)  --no-faiss");
+    }
+
+    report_recall_for_index(&idx4, db.view(), queries.view(), k, &label);
+
+    eprintln!(
+        "=== latency (bits=4): tq_ms_per_query={tq_ms:.4}  faiss_ms_per_query={} ===",
+        faiss_ms
+            .map(|x| format!("{x:.4}"))
+            .unwrap_or_else(|| "null".to_string())
+    );
 
     let report = FoodBenchReport {
         dataset_path: csv_path.display().to_string(),
@@ -384,14 +479,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n_query: n_q,
         },
         notes: "Mean/min/std of Recall@k vs brute-force cosine on dense f32 DB. \
-                Memory: bytes_quantized_corpus_payload vs bytes_dense_db_vectors_only; fi stillull index includes rotation Q. \
+                Memory: bytes_quantized_corpus_payload vs bytes_dense_db_vectors_only; full index includes rotation Q. \
                 Search: reference_search.brute_dense_cosine_topk_batch_ms = dense fp32 linear scan for all queries (exact top-k). \
                 speedup_wide_vs_brute_dense_batch = brute_ms / turboquant_wide_ms: > 1 means TurboQuant Wide batch is faster wall-clock; \
                 < 1 means dense brute was faster on this run (common at modest n where float dot-products are very cheap vs unpack/LUT). \
                 speedup_scalar_vs_brute_dense_batch is the same using Scalar batch timings. \
-                Extrapolation uses n=10M for corpus vs index structure formulas.",
+                Extrapolation uses n=10M for corpus vs index structure formulas. \
+                reference_latency_ms_per_query matches glove_angular_bench / benchmarks/faiss_npy_time.py (median ms/query after warmup).",
         reference_search: ReferenceSearchBench {
             brute_dense_cosine_topk_batch_ms: brute_batch_ms,
+        },
+        reference_latency_ms_per_query: ReferenceLatencyMs {
+            timed_runs,
+            tq_ms_per_query: tq_ms,
+            faiss_ms_per_query: faiss_ms,
+            faiss_pq_backend: faiss_backend,
+            faiss_skipped_reason: faiss_skipped_reason,
         },
         configs,
     };
