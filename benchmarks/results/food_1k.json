@@ -10,9 +10,9 @@
     "n_db": 850,
     "n_query": 150
   },
-  "notes": "Mean/min/std of Recall@k vs brute-force cosine on dense f32 DB. Memory: bytes_quantized_corpus_payload vs bytes_dense_db_vectors_only; fi stillull index includes rotation Q. Search: reference_search.brute_dense_cosine_topk_batch_ms = dense fp32 linear scan for all queries (exact top-k). speedup_wide_vs_brute_dense_batch = brute_ms / turboquant_wide_ms: > 1 means TurboQuant Wide batch is faster wall-clock; < 1 means dense brute was faster on this run (common at modest n where float dot-products are very cheap vs unpack/LUT). speedup_scalar_vs_brute_dense_batch is the same using Scalar batch timings. Extrapolation uses n=10M for corpus vs index structure formulas.",
+  "notes": "Mean/min/std of Recall@k vs brute-force cosine on dense f32 DB. Memory: bytes_quantized_corpus_payload vs bytes_dense_db_vectors_only; full index includes rotation Q. Search: reference_search.brute_dense_cosine_topk_batch_ms = dense fp32 linear scan for all queries (exact top-k). speedup_wide_vs_brute_dense_batch = brute_ms / turboquant_wide_ms: > 1 means TurboQuant Wide batch is faster wall-clock; < 1 means dense brute was faster on this run (common at modest n where float dot-products are very cheap vs unpack/LUT). speedup_scalar_vs_brute_dense_batch is the same using Scalar batch timings. Extrapolation uses n=10M for corpus vs index structure formulas.",
   "reference_search": {
-    "brute_dense_cosine_topk_batch_ms": 197.158
+    "brute_dense_cosine_topk_batch_ms": 131.79637499999998
   },
   "configs": [
     {
@@ -38,12 +38,12 @@
       "extrapolated_quantized_corpus_payload_bytes_n10m": 3880000000,
       "extrapolated_index_structure_bytes_n10m": 3889437212,
       "timings_ms": {
-        "build_index": 1597.657291,
-        "search_wide_batch": 255.101625,
-        "search_scalar_batch": 239.538
+        "build_index": 497.46970899999997,
+        "search_wide_batch": 33.102542,
+        "search_scalar_batch": 37.948875
       },
-      "speedup_wide_vs_brute_dense_batch": 0.7728606197628102,
-      "speedup_scalar_vs_brute_dense_batch": 0.823076088136329,
+      "speedup_wide_vs_brute_dense_batch": 3.9814578288277676,
+      "speedup_scalar_vs_brute_dense_batch": 3.4729982114094287,
       "recall_at_k": {
         "mean": 0.8600005,
         "std_sample": 0.11815125,
@@ -74,12 +74,12 @@
       "extrapolated_quantized_corpus_payload_bytes_n10m": 7720000000,
       "extrapolated_index_structure_bytes_n10m": 7729437308,
       "timings_ms": {
-        "build_index": 1871.720583,
-        "search_wide_batch": 308.91974999999996,
-        "search_scalar_batch": 287.540542
+        "build_index": 529.254541,
+        "search_wide_batch": 39.245250000000006,
+        "search_scalar_batch": 44.128750000000004
       },
-      "speedup_wide_vs_brute_dense_batch": 0.6382175306046312,
-      "speedup_scalar_vs_brute_dense_batch": 0.685670266281963,
+      "speedup_wide_vs_brute_dense_batch": 3.3582758422993857,
+      "speedup_scalar_vs_brute_dense_batch": 2.9866328640625435,
       "recall_at_k": {
         "mean": 0.9553335,
         "std_sample": 0.056207508,
