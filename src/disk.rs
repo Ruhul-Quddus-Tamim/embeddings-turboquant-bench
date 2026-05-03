@@ -1,4 +1,4 @@
-//! Versioned snapshot I/O (`TQ01` magic, format `v1` / `v2`).
+//! Versioned snapshot I/O (`TQ01` magic, **v1** / **v2** MSE with rotation `Q` on disk).
 use std::{
     fs::File,
     io::{Read, Write},
@@ -13,12 +13,14 @@ use crate::{
     packing::packed_row_bytes,
 };
 
-/// File magic + format version (`v1` / `v2` little-endian payloads).
+/// File magic + format version (`v1` / `v2`).
 pub const MAGIC: &[u8; 4] = b"TQ01";
 const VERSION_V1: u32 = 1;
 const VERSION_V2: u32 = 2;
+const VERSION_V3: u32 = 3;
 
 const SCHEME_MSE: u8 = 0;
+/// Historical: product+QJL snapshots are no longer loaded; see [`read_v2`].
 const SCHEME_PROD: u8 = 1;
 
 fn wr_u32<W: Write>(w: &mut W, v: u32) -> std::io::Result<()> {
@@ -48,29 +50,22 @@ fn rd_f32<R: Read>(r: &mut R) -> std::io::Result<f32> {
 }
 
 pub fn write(path: &Path, idx: &TurboQuantIndex) -> std::io::Result<()> {
+    write_v2(path, idx)
+}
+
+fn write_v2(path: &Path, idx: &TurboQuantIndex) -> std::io::Result<()> {
     let mut w = File::create(path)?;
     w.write_all(MAGIC)?;
     wr_u32(&mut w, VERSION_V2)?;
     wr_u32(&mut w, idx.dim() as u32)?;
     w.write_all(&[idx.bits()])?;
-    let scheme = if idx.is_prod_quantizer() {
-        SCHEME_PROD
-    } else {
-        SCHEME_MSE
-    };
-    w.write_all(&[scheme])?;
+    w.write_all(&[SCHEME_MSE])?;
     wr_u64(&mut w, idx.seed())?;
     wr_u32(&mut w, idx.lloyd_iterations() as u32)?;
     wr_u64(&mut w, idx.len() as u64)?;
 
     for &x in idx.rotation().iter() {
         w.write_all(&x.to_le_bytes())?;
-    }
-
-    if let Some(sv) = idx.s_matrix() {
-        for &x in sv.iter() {
-            w.write_all(&x.to_le_bytes())?;
-        }
     }
 
     let b = idx.scalar_quant_tables().boundaries.len() as u32;
@@ -107,11 +102,19 @@ pub fn read(path: &Path) -> std::io::Result<TurboQuantIndex> {
     match ver {
         VERSION_V1 => read_v1(&mut r),
         VERSION_V2 => read_v2(&mut r),
+        VERSION_V3 => read_v3_unsupported(),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "unsupported snapshot version",
         )),
     }
+}
+
+fn read_v3_unsupported() -> std::io::Result<TurboQuantIndex> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "snapshot v3 (historical third-party bit-plane layout) is no longer supported; use v1/v2 snapshots or rebuild the index with this crate",
+    ))
 }
 
 fn read_v1<R: Read>(r: &mut R) -> std::io::Result<TurboQuantIndex> {
@@ -136,7 +139,6 @@ fn read_v1<R: Read>(r: &mut R) -> std::io::Result<TurboQuantIndex> {
         seed,
         lloyd_iterations,
         rotation_q,
-        None,
         quantizer,
         norms,
         packed,
@@ -151,37 +153,27 @@ fn read_v2<R: Read>(r: &mut R) -> std::io::Result<TurboQuantIndex> {
     let mut scheme_arr = [0u8; 1];
     r.read_exact(&mut scheme_arr)?;
     let scheme = scheme_arr[0];
+    if scheme == SCHEME_PROD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot format Q_prod (product + QJL) is no longer supported; use an MSE-only snapshot",
+        ));
+    }
+    if scheme != SCHEME_MSE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid quantizer scheme byte",
+        ));
+    }
     let seed = rd_u64(r)?;
     let lloyd_iterations = rd_u32(r)? as usize;
     let nvec = rd_u64(r)? as usize;
 
     let rotation_q = read_matrix_f32(r, dim)?;
 
-    let s_matrix = if scheme == SCHEME_PROD {
-        if !(2..=8).contains(&bits) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Q_prod snapshot requires bits in 2..=8",
-            ));
-        }
-        Some(read_matrix_f32(r, dim)?)
-    } else if scheme != SCHEME_MSE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid quantizer scheme byte",
-        ));
-    } else {
-        None
-    };
-
-    let quant_bits = if s_matrix.is_some() { bits - 1 } else { bits };
-    let quantizer = read_quantizer(r, dim, quant_bits)?;
+    let quantizer = read_quantizer(r, dim, bits)?;
     let norms = read_norms(r, nvec)?;
-    let row_b = if s_matrix.is_some() {
-        packed_row_bytes(dim, quant_bits) + packed_row_bytes(dim, 1) + 4
-    } else {
-        packed_row_bytes(dim, bits)
-    };
+    let row_b = packed_row_bytes(dim, bits);
     let packed = read_packed(r, nvec, row_b)?;
 
     Ok(TurboQuantIndex::from_loaded(
@@ -190,7 +182,6 @@ fn read_v2<R: Read>(r: &mut R) -> std::io::Result<TurboQuantIndex> {
         seed,
         lloyd_iterations,
         rotation_q,
-        s_matrix,
         quantizer,
         norms,
         packed,
@@ -198,16 +189,21 @@ fn read_v2<R: Read>(r: &mut R) -> std::io::Result<TurboQuantIndex> {
 }
 
 fn read_matrix_f32<R: Read>(r: &mut R, dim: usize) -> std::io::Result<Array2<f32>> {
-    let mut q_flat = Vec::with_capacity(dim * dim);
-    for _ in 0..(dim * dim) {
-        q_flat.push(rd_f32(r)?);
+    let n = dim * dim;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(rd_f32(r)?);
     }
-    Array2::from_shape_vec((dim, dim), q_flat).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("matrix shape {e:?}"))
+    Array2::from_shape_vec((dim, dim), v).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
     })
 }
 
-fn read_quantizer<R: Read>(r: &mut R, dim: usize, bits: u8) -> std::io::Result<GaussianQuantizer> {
+fn read_quantizer<R: Read>(
+    r: &mut R,
+    dim: usize,
+    bits: u8,
+) -> std::io::Result<GaussianQuantizer> {
     let nb = rd_u32(r)? as usize;
     let mut boundaries = Vec::with_capacity(nb);
     for _ in 0..nb {
@@ -220,7 +216,10 @@ fn read_quantizer<R: Read>(r: &mut R, dim: usize, bits: u8) -> std::io::Result<G
     }
     let sigma = (1.0f32 / dim as f32).sqrt();
     Ok(GaussianQuantizer::from_quant_tables(
-        bits, sigma, boundaries, centroids,
+        bits,
+        sigma,
+        boundaries,
+        centroids,
     ))
 }
 
@@ -233,8 +232,10 @@ fn read_norms<R: Read>(r: &mut R, nvec: usize) -> std::io::Result<Vec<f32>> {
 }
 
 fn read_packed<R: Read>(r: &mut R, nvec: usize, row_b: usize) -> std::io::Result<Vec<u8>> {
-    let packed_len = nvec * row_b;
-    let mut packed = vec![0u8; packed_len];
+    let total = nvec
+        .checked_mul(row_b)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "packed size overflow"))?;
+    let mut packed = vec![0u8; total];
     r.read_exact(&mut packed)?;
     Ok(packed)
 }
