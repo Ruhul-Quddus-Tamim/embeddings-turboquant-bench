@@ -197,4 +197,4 @@ Compared to **exact cosine** top‑**k** on the **same dense** rows: **`mean`** 
 
 ## Citation
 
-- Zandieh et al., *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate* — [arXiv:2504.19874](https://arxiv.org/abs/2504.19874).
+- Zandieh et al., *TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate* - [arXiv:2504.19874](https://arxiv.org/abs/2504.19874).
