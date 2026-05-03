@@ -41,6 +41,27 @@ pub fn unpack_code(bytes: &[u8], dim: usize, bits: u8, dim_idx: usize) -> u8 {
     v as u8
 }
 
+/// Expand one packed row to `dim` raw code bytes (`0..2^bits`).
+pub fn unpack_row_to_codes(bytes: &[u8], dim: usize, bits: u8, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(dim);
+    for d in 0..dim {
+        out.push(unpack_code(bytes, dim, bits, d));
+    }
+}
+
+/// Fill `out` with all database rows' codes (`n_rows * dim` bytes).
+pub fn unpack_all_rows(packed: &[u8], n_rows: usize, dim: usize, bits: u8, row_bytes: usize, out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(n_rows * dim);
+    for i in 0..n_rows {
+        let row = &packed[i * row_bytes..(i + 1) * row_bytes];
+        for d in 0..dim {
+            out.push(unpack_code(row, dim, bits, d));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
