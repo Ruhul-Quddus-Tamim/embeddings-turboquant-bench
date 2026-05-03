@@ -1,0 +1,15 @@
+speed_median_ms_per_query (warmup + 5 timed runs, RAYON_NUM_THREADS=1): tq_ms_per_query=0.3305
+
+faiss_ms_per_query=0.3360  backend=IndexPQFastScan(m=200,nbits=4)  (same protocol as benchmarks/benchmark_speed_glove200.py)
+
+dataset=/Users/sitifatimahali/Desktop/exp/vector_embeddings_turboquant/data/glove_train.npy + /Users/sitifatimahali/Desktop/exp/vector_embeddings_turboquant/data/glove_test.npy (100000×200 train, 1000×200 test, angular)
+
+dim=200 bits=4 n_db=100000 n_queries=1000 k=64 index_seed=99 lloyd_iters=80
+
+search_batch_ms: brute_dense_cosine(top-k all queries)=9369.2278 turboquant_wide(top-k all queries)=331.9645
+
+speedup_wide_vs_brute_dense_batch=28.2236 (>1 ⇒ TurboQuant wide batch faster on this machine; often <1 for small n_db)
+
+mean Recall@64 (overlap with exact cosine brute force): 0.8455
+
+max_abs_diff(scalar SIMD vs wide SIMD one query scores): 0.000000
