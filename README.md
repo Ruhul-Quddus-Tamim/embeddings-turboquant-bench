@@ -1,6 +1,6 @@
 # Vector embeddings with TurboQuant
 
-Rust library that implements a **compressed** vector index: random orthogonal rotation, **Lloyd–Max scalar quantization** on Gaussian‑marginal coordinates, bit‑packed codes, and **LUT‑based** approximate top‑**k** search (wide / scalar SIMD, with an aarch64 NEON fast path when geometry and bit‑width match).
+Rust library that implements a **compressed** vector index: random orthogonal rotation, **Lloyd–Max scalar quantization** on Gaussian‑marginal coordinates, bit‑packed codes, and **LUT‑based** approximate top‑**k** search.
 
 ## TurboQuant Findings
 
