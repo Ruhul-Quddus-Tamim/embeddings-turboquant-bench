@@ -1,26 +1,89 @@
-use ndarray::{Array1, ArrayView2, Axis};
+#[cfg(target_arch = "aarch64")]
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex, RwLock};
+
+use ndarray::{ArrayView2, Axis};
+use ndarray::linalg::general_mat_mul;
 
 use crate::lloyd_max::{build_gaussian_lloyd_max, GaussianQuantizer};
-use crate::packing::{pack_row, packed_row_bytes};
-use crate::qjl::{encode_qjl_signs, apply_gaussian_matvec, random_gaussian_matrix, QJL_INVERSE_NUMERATOR};
+use crate::packing::{pack_row, packed_row_bytes, unpack_all_rows};
 use crate::rotation::{apply_rotation, random_orthogonal_matrix};
-use crate::simd::{flatten_query_lut, scores_for_query, scores_for_query_prod, Scorer};
+use crate::simd::{
+    flatten_query_lut, scores_for_query, scores_for_query_decoded, Scorer,
+};
 
-#[derive(Debug, Clone)]
+/// Scratch buffers reused across searches: L2‑normalize queries and `queries_unit @ rotationᵀ` without
+/// allocating new `nq×dim` arrays on every [`TurboQuantIndex::search_topk_indices`] call (latency-critical).
+#[derive(Debug)]
+pub(crate) struct SearchScratch {
+    normed_queries: ndarray::Array2<f32>,
+    q_rot: ndarray::Array2<f32>,
+    query_norms: Vec<f32>,
+    #[cfg(target_arch = "aarch64")]
+    neon: RefCell<crate::search_blocked_neon::Aarch64NeonSearchReuse>,
+}
+
+impl SearchScratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            normed_queries: ndarray::Array2::<f32>::zeros((1usize, 1usize)),
+            q_rot: ndarray::Array2::<f32>::zeros((1usize, 1usize)),
+            query_norms: Vec::new(),
+            #[cfg(target_arch = "aarch64")]
+            neon: RefCell::new(crate::search_blocked_neon::Aarch64NeonSearchReuse::new()),
+        }
+    }
+
+    #[inline]
+    fn ensure_queries_shape(mat: &mut ndarray::Array2<f32>, nq: usize, dim: usize) {
+        let (r, c) = (mat.nrows(), mat.ncols());
+        if r != nq || c != dim {
+            *mat = ndarray::Array2::<f32>::zeros((nq, dim));
+        }
+    }
+
+    /// Copies `queries_row_major`, L2‑normalizes rows, writes **`normed @ rotationᵀ`** into **`q_rot`**,
+    /// and fills **`query_norms`** (`rotationᵀ` is `rotation_q.t()`).
+    #[inline]
+    pub(crate) fn fill_queries_rotated(
+        &mut self,
+        queries_row_major: &[f32],
+        nq: usize,
+        dim: usize,
+        rotation_t: ndarray::ArrayView2<'_, f32>,
+    ) {
+        debug_assert_eq!(queries_row_major.len(), nq * dim);
+
+        Self::ensure_queries_shape(&mut self.normed_queries, nq, dim);
+        Self::ensure_queries_shape(&mut self.q_rot, nq, dim);
+
+        let unit = &mut self.normed_queries;
+        unit.as_slice_mut().unwrap()[..nq * dim].copy_from_slice(queries_row_major);
+        normalize_rows_inplace_collect_norms(unit, &mut self.query_norms);
+        debug_assert_eq!(self.query_norms.len(), nq);
+        general_mat_mul(1.0_f32, &unit.view(), &rotation_t, 0.0_f32, &mut self.q_rot.view_mut());
+    }
+}
+
+/// TurboQuant MSE index: Gaussian-marginal Lloyd–Max (`bits` per coordinate), random orthogonal `Q`,
+/// bit-packed codes, LUT search ([`crate::simd`]).
+#[derive(Debug)]
 pub struct TurboQuantIndex {
     pub(crate) dim: usize,
-    /// Total target bits per coordinate: `b` for [`TurboQuantIndex::new`], same `b` for [`TurboQuantIndex::new_prod`]
-    /// (MSE stage uses `b - 1` plus one QJL bit per coordinate).
+    /// Total bits per coordinate for MSE quantization (`b` in [`TurboQuantIndex::new`]).
     pub(crate) bits: u8,
     pub(crate) seed: u64,
     lloyd_iterations: usize,
     rotation_q: ndarray::Array2<f32>,
-    /// `None` — MSE-only [`TurboQuantIndex::new`]. `Some(S)` — inner-product [`TurboQuantIndex::new_prod`].
-    s_matrix: Option<ndarray::Array2<f32>>,
     scalar_quant: GaussianQuantizer,
     norms: Vec<f32>,
     packed: Vec<u8>,
+    decoded_flat: Vec<u8>,
     row_packed_bytes: usize,
+    /// Lazily built blocked-code layout for NEON nibble‑LUT search (4‑bit lanes); cleared on [`Self::add_vectors`].
+    blocked_codes_neon: RwLock<Option<Arc<Vec<u8>>>>,
+    /// Query rotation + aarch64 NEON scratch reused across [`Self::search_topk_indices`] (avoids per-call `nq×dim` allocations).
+    search_workspace: Mutex<SearchScratch>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,50 +116,19 @@ impl TurboQuantIndex {
             seed,
             lloyd_iterations,
             rotation_q,
-            s_matrix: None,
             scalar_quant,
             norms: Vec::new(),
             packed: Vec::new(),
+            decoded_flat: Vec::new(),
             row_packed_bytes,
+            blocked_codes_neon: RwLock::new(None),
+            search_workspace: Mutex::new(SearchScratch::new()),
         }
     }
 
-    /// TurboQuant **Q_prod** (Algorithm 2): `(b−1)`-bit MSE stage plus **QJL** on the residual, for **b** bits/coordinate overall (`b ≥ 2`).
-    pub fn new_prod(dim: usize, bits: u8, seed: u64) -> Self {
-        Self::new_prod_with_lloyd_iterations(dim, bits, seed, 80)
-    }
-
-    pub fn new_prod_with_lloyd_iterations(
-        dim: usize,
-        bits: u8,
-        seed: u64,
-        lloyd_iterations: usize,
-    ) -> Self {
-        assert!(dim > 1);
-        assert!(
-            (2..=8).contains(&bits),
-            "Q_prod requires bits in 2..=8 (need b-1 ≥ 1 for the MSE stage)"
-        );
-        let sigma = (1.0f32 / dim as f32).sqrt();
-        let mse_bits = bits - 1;
-        let scalar_quant = build_gaussian_lloyd_max(mse_bits, sigma, lloyd_iterations);
-        let rotation_q = random_orthogonal_matrix(dim, seed);
-        let s_matrix = random_gaussian_matrix(dim, seed);
-        let row_packed_bytes =
-            packed_row_bytes(dim, mse_bits) + packed_row_bytes(dim, 1) + 4;
-        Self {
-            dim,
-            bits,
-            seed,
-            lloyd_iterations,
-            rotation_q,
-            s_matrix: Some(s_matrix),
-            scalar_quant,
-            norms: Vec::new(),
-            packed: Vec::new(),
-            row_packed_bytes,
-        }
-    }
+    /// Reserved for API compatibility; indexing does not require a separate warm-up step.
+    #[inline]
+    pub fn prepare(&self) {}
 
     #[inline]
     pub fn len(&self) -> usize {
@@ -123,18 +155,10 @@ impl TurboQuantIndex {
         self.rotation_q.view()
     }
 
-    /// Random Gaussian matrix **S** for QJL (`Q_prod` only).
-    #[inline]
-    pub fn s_matrix(&self) -> Option<ndarray::ArrayView2<'_, f32>> {
-        self.s_matrix.as_ref().map(|s| s.view())
+    pub fn rotation_matrix(&self) -> ndarray::Array2<f32> {
+        self.rotation_q.clone()
     }
 
-    #[inline]
-    pub fn is_prod_quantizer(&self) -> bool {
-        self.s_matrix.is_some()
-    }
-
-    /// Bits used by the MSE scalar stage (equals [`Self::bits`] for MSE mode, or `bits - 1` for `Q_prod`).
     #[inline]
     pub fn mse_bits_per_coordinate(&self) -> u8 {
         self.scalar_quant.bits
@@ -181,33 +205,28 @@ impl TurboQuantIndex {
         seed: u64,
         lloyd_iterations: usize,
         rotation_q: ndarray::Array2<f32>,
-        s_matrix: Option<ndarray::Array2<f32>>,
         scalar_quant: GaussianQuantizer,
         norms: Vec<f32>,
         packed: Vec<u8>,
     ) -> Self {
-        let row_packed_bytes = if s_matrix.is_some() {
-            packed_row_bytes(dim, scalar_quant.bits) + packed_row_bytes(dim, 1) + 4
-        } else {
-            assert_eq!(
-                scalar_quant.bits, bits,
-                "MSE snapshot: quantizer bits must match index bits"
-            );
-            packed_row_bytes(dim, bits)
-        };
-        if let Some(ref s) = s_matrix {
-            assert_eq!(s.nrows(), dim);
-            assert_eq!(s.ncols(), dim);
-            assert_eq!(
-                scalar_quant.bits,
-                bits - 1,
-                "Q_prod snapshot: MSE stage must use bits-1"
-            );
-        }
+        assert_eq!(
+            scalar_quant.bits, bits,
+            "MSE snapshot: quantizer bits must match index bits"
+        );
+        let row_packed_bytes = packed_row_bytes(dim, bits);
         assert_eq!(
             norms.len() * row_packed_bytes,
             packed.len(),
             "packed length mismatch"
+        );
+        let mut decoded_flat = Vec::new();
+        unpack_all_rows(
+            &packed,
+            norms.len(),
+            dim,
+            bits,
+            row_packed_bytes,
+            &mut decoded_flat,
         );
         Self {
             dim,
@@ -215,12 +234,43 @@ impl TurboQuantIndex {
             seed,
             lloyd_iterations,
             rotation_q,
-            s_matrix,
             scalar_quant,
             norms,
             packed,
+            decoded_flat,
             row_packed_bytes,
+            blocked_codes_neon: RwLock::new(None),
+            search_workspace: Mutex::new(SearchScratch::new()),
         }
+    }
+
+    fn blocked_codes_neon_cache(&self) -> Arc<Vec<u8>> {
+        let n = self.len();
+        let dim = self.dim;
+        debug_assert!(crate::search_blocked_neon::neon_mse_blocked_eligible(
+            self.bits,
+            dim,
+            self.decoded_flat.len(),
+            n
+        ));
+        {
+            let guard = self.blocked_codes_neon.read().unwrap();
+            if let Some(ref arc) = *guard {
+                return arc.clone();
+            }
+        }
+        let mut guard = self.blocked_codes_neon.write().unwrap();
+        if let Some(ref arc) = *guard {
+            return arc.clone();
+        }
+        let v = Arc::new(crate::search_blocked_neon::build_blocked_codes_from_decoded(
+            &self.decoded_flat,
+            n,
+            dim,
+            self.bits,
+        ));
+        *guard = Some(v.clone());
+        v
     }
 
     /// Append row-major `[n, dim]` vectors (`f32`).
@@ -232,14 +282,13 @@ impl TurboQuantIndex {
         let q = self.rotation_q.view();
         for row in rows.axis_iter(Axis(0)) {
             let slice = row.as_slice().expect("row-major contiguous rows");
-            let (norm, slab) = if let Some(ref s) = self.s_matrix {
-                encode_row_prod(slice, self.dim, self.bits, q, s.view(), &self.scalar_quant)
-            } else {
-                encode_row(slice, self.dim, self.bits, q, &self.scalar_quant)
-            };
+            let (norm, slab, codes) =
+                encode_row(slice, self.dim, self.bits, q, &self.scalar_quant);
             self.norms.push(norm);
             self.packed.extend_from_slice(&slab);
+            self.decoded_flat.extend_from_slice(&codes);
         }
+        *self.blocked_codes_neon.write().unwrap() = None;
     }
 
     /// Top‑`k` approximate neighbors per query (higher score is better).
@@ -254,62 +303,222 @@ impl TurboQuantIndex {
         assert!(k > 0, "k must be positive");
         assert!(db_n >= k, "k cannot exceed database size {db_n}");
 
-        let centroids_slice = self.centroids();
+        let centroids_slice = self.scalar_quant.centroids.as_slice();
         let nl = centroids_slice.len();
         let dim = self.dim;
         let mse_bits = self.scalar_quant.bits;
         let scale_by_norms = cfg.objective == SearchObjective::InnerProduct;
         let rotation = self.rotation_q.view();
-        let qjl_scale = QJL_INVERSE_NUMERATOR / dim as f32;
 
-        queries
-            .axis_iter(Axis(0))
-            .map(|q_view| {
-                let q_row = q_view.as_slice().expect("query row contiguous");
-                let (qnorm, q_rot_vec) = rotated_unit_parts(q_row, dim, rotation);
-                let lut = flatten_query_lut(&q_rot_vec, centroids_slice, dim);
+        let nq = queries.nrows();
+        let queries_row_major = queries
+            .as_slice()
+            .expect("search_topk_indices: queries must be contiguous row-major f32 slice");
+        let mut ws = self
+            .search_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ws.fill_queries_rotated(queries_row_major, nq, dim, rotation.t());
+        let q_rot_all = &ws.q_rot;
+        let query_norms_batch = ws.query_norms.as_slice();
 
-                let scores = if let Some(ref s) = self.s_matrix {
-                    let unit_q =
-                        Array1::from_shape_fn(dim, |i| q_row[i] / qnorm.max(f32::MIN_POSITIVE));
-                    let s_q = apply_gaussian_matvec(s.view(), unit_q.view());
-                    let s_q_sl = s_q.as_slice().unwrap();
-                    let mse_b = packed_row_bytes(dim, mse_bits);
-                    let qjl_b = packed_row_bytes(dim, 1);
-                    scores_for_query_prod(
-                        &self.packed,
-                        &self.norms,
-                        dim,
-                        mse_bits,
-                        mse_b,
-                        qjl_b,
-                        self.row_packed_bytes,
-                        &lut,
-                        nl,
-                        s_q_sl,
-                        qjl_scale,
-                        qnorm,
-                        scale_by_norms,
-                        cfg.scorer,
-                    )
-                } else {
-                    scores_for_query(
-                        &self.packed,
-                        &self.norms,
-                        dim,
-                        mse_bits,
-                        db_n,
-                        self.row_packed_bytes,
-                        &lut,
-                        nl,
-                        qnorm,
-                        scale_by_norms,
-                        cfg.scorer,
-                    )
-                };
-                topk_argmax_indices(&scores, k)
-            })
-            .collect()
+        #[cfg(target_arch = "aarch64")]
+        {
+            let use_neon = crate::search_blocked_neon::neon_mse_blocked_eligible(
+                self.bits,
+                dim,
+                self.decoded_flat.len(),
+                db_n,
+            ) && matches!(cfg.scorer, Scorer::Wide);
+            if use_neon {
+                let blocked = self.blocked_codes_neon_cache();
+                let codes_per_byte = (8 / self.bits) as usize;
+                let nbg = dim / codes_per_byte;
+                let bits_u = self.bits as usize;
+                let mut out = Vec::with_capacity(nq);
+                let mut neon_reuse = ws.neon.borrow_mut();
+                let n = &mut *neon_reuse;
+                if k < db_n {
+                    n.topk4.ensure_k(k);
+                    n.topk1.ensure_k(k);
+                }
+                let mut qi = 0usize;
+                while qi < nq {
+                    let batch = (nq - qi).min(4);
+                    if batch == 4 {
+                        let r0 = q_rot_lut_row(q_rot_all, qi);
+                        let r1 = q_rot_lut_row(q_rot_all, qi + 1);
+                        let r2 = q_rot_lut_row(q_rot_all, qi + 2);
+                        let r3 = q_rot_lut_row(q_rot_all, qi + 3);
+                        let (s0, b0) =
+                            n.lut_scratch_batch[0].build(r0, centroids_slice, bits_u, dim);
+                        let (s1, b1) =
+                            n.lut_scratch_batch[1].build(r1, centroids_slice, bits_u, dim);
+                        let (s2, b2) =
+                            n.lut_scratch_batch[2].build(r2, centroids_slice, bits_u, dim);
+                        let (s3, b3) =
+                            n.lut_scratch_batch[3].build(r3, centroids_slice, bits_u, dim);
+                        let lut_u8: [&[u8]; 4] = [
+                            n.lut_scratch_batch[0].uint8_luts(),
+                            n.lut_scratch_batch[1].uint8_luts(),
+                            n.lut_scratch_batch[2].uint8_luts(),
+                            n.lut_scratch_batch[3].uint8_luts(),
+                        ];
+                        let scales = [s0, s1, s2, s3];
+                        let biases = [b0, b1, b2, b3];
+                        if k >= db_n {
+                            let mut scores4 = vec![f32::NEG_INFINITY; 4 * db_n];
+                            crate::search_blocked_neon::scores_4x_4bit_blocked_neon(
+                                blocked.as_slice(),
+                                lut_u8,
+                                scales,
+                                biases,
+                                nbg,
+                                &self.norms,
+                                db_n,
+                                scale_by_norms,
+                                &mut scores4,
+                            );
+                            for off in 0..4 {
+                                let qnorm = query_norms_batch[qi + off];
+                                let row = &mut scores4[off * db_n..(off + 1) * db_n];
+                                if scale_by_norms {
+                                    for s in row.iter_mut() {
+                                        *s *= qnorm;
+                                    }
+                                }
+                                out.push(topk_argmax_indices(row, k));
+                            }
+                        } else {
+                            let qscale = [
+                                if scale_by_norms {
+                                    query_norms_batch[qi]
+                                } else {
+                                    1.0
+                                },
+                                if scale_by_norms {
+                                    query_norms_batch[qi + 1]
+                                } else {
+                                    1.0
+                                },
+                                if scale_by_norms {
+                                    query_norms_batch[qi + 2]
+                                } else {
+                                    1.0
+                                },
+                                if scale_by_norms {
+                                    query_norms_batch[qi + 3]
+                                } else {
+                                    1.0
+                                },
+                            ];
+                            let tops =
+                                crate::search_blocked_neon::search_4x_4bit_blocked_neon_topk(
+                                    blocked.as_slice(),
+                                    lut_u8,
+                                    scales,
+                                    biases,
+                                    nbg,
+                                    &self.norms,
+                                    db_n,
+                                    scale_by_norms,
+                                    scale_by_norms,
+                                    qscale,
+                                    k,
+                                    &mut n.topk4,
+                                );
+                            out.extend(tops);
+                        }
+                        qi += 4;
+                    } else {
+                        for off in 0..batch {
+                            let qii = qi + off;
+                            let qnorm = query_norms_batch[qii];
+                            let q_rot_row = q_rot_lut_row(q_rot_all, qii);
+                            let (scale, bias) = n
+                                .lut_scratch_tail
+                                .build(q_rot_row, centroids_slice, bits_u, dim);
+                            let lut_sl = n.lut_scratch_tail.uint8_luts();
+                            if k >= db_n {
+                                let mut scores = vec![f32::NEG_INFINITY; db_n];
+                                crate::search_blocked_neon::scores_4bit_blocked_neon(
+                                    blocked.as_slice(),
+                                    lut_sl,
+                                    scale,
+                                    bias,
+                                    nbg,
+                                    &self.norms,
+                                    db_n,
+                                    scale_by_norms,
+                                    &mut scores,
+                                );
+                                if scale_by_norms {
+                                    for s in &mut scores {
+                                        *s *= qnorm;
+                                    }
+                                }
+                                out.push(topk_argmax_indices(&scores, k));
+                            } else {
+                                out.push(
+                                    crate::search_blocked_neon::search_1x_4bit_blocked_neon_topk(
+                                        blocked.as_slice(),
+                                        lut_sl,
+                                        scale,
+                                        bias,
+                                        nbg,
+                                        &self.norms,
+                                        db_n,
+                                        scale_by_norms,
+                                        scale_by_norms,
+                                        qnorm,
+                                        k,
+                                        &mut n.topk1,
+                                    ),
+                                );
+                            }
+                        }
+                        qi += batch;
+                    }
+                }
+                return out;
+            }
+        }
+
+        (0..nq)
+            .map(|qi| {
+                    let qnorm = query_norms_batch[qi];
+                    let q_rot_slice = q_rot_lut_row(q_rot_all, qi);
+                    let lut = flatten_query_lut(q_rot_slice, centroids_slice, dim);
+                    let scores = if self.decoded_flat.len() == db_n * dim {
+                        scores_for_query_decoded(
+                            &self.decoded_flat,
+                            &self.norms,
+                            dim,
+                            db_n,
+                            &lut,
+                            nl,
+                            qnorm,
+                            scale_by_norms,
+                            cfg.scorer,
+                        )
+                    } else {
+                        scores_for_query(
+                            &self.packed,
+                            &self.norms,
+                            dim,
+                            mse_bits,
+                            db_n,
+                            self.row_packed_bytes,
+                            &lut,
+                            nl,
+                            qnorm,
+                            scale_by_norms,
+                            cfg.scorer,
+                        )
+                    };
+                    topk_argmax_indices(&scores, k)
+                })
+                .collect()
     }
 
     pub fn write_disk(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
@@ -321,6 +530,7 @@ impl TurboQuantIndex {
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn rotated_unit_parts(
     vec: &[f32],
@@ -345,7 +555,7 @@ fn encode_row(
     bits: u8,
     rotation_mat: ndarray::ArrayView2<f32>,
     quant: &GaussianQuantizer,
-) -> (f32, Vec<u8>) {
+) -> (f32, Vec<u8>, Vec<u8>) {
     assert_eq!(vec.len(), dim);
     let mut s = 0f32;
     for &x in vec {
@@ -363,68 +573,106 @@ fn encode_row(
     let row_b = packed_row_bytes(dim, bits);
     let mut buf = vec![0u8; row_b];
     pack_row(&codes, dim, bits, &mut buf);
-    (norm, buf)
-}
-
-#[inline]
-fn encode_row_prod(
-    vec: &[f32],
-    dim: usize,
-    bits_total: u8,
-    rotation_mat: ndarray::ArrayView2<f32>,
-    s: ndarray::ArrayView2<f32>,
-    quant: &GaussianQuantizer,
-) -> (f32, Vec<u8>) {
-    assert_eq!(quant.bits, bits_total - 1);
-    let mse_bits = quant.bits;
-    let mut ssum = 0f32;
-    for &x in vec {
-        ssum += x * x;
-    }
-    let norm = ssum.sqrt().max(f32::MIN_POSITIVE);
-    let unit = Array1::from_shape_fn(dim, |i| vec[i] / norm);
-    let rotated = apply_rotation(rotation_mat, unit.view());
-
-    let mut codes = vec![0u8; dim];
-    for (i, &z) in rotated.iter().enumerate() {
-        codes[i] = quant.encode(z);
-    }
-
-    let y_rec = Array1::from_shape_fn(dim, |i| quant.reconstruct(codes[i]));
-    let u_mse = apply_rotation(rotation_mat.t(), y_rec.view());
-    let r = &unit - &u_mse;
-    let mut gsq = 0f32;
-    for &x in r.iter() {
-        gsq += x * x;
-    }
-    let gamma = gsq.sqrt();
-
-    let mse_row_b = packed_row_bytes(dim, mse_bits);
-    let qjl_row_b = packed_row_bytes(dim, 1);
-    let total_b = mse_row_b + qjl_row_b + 4;
-    let mut buf = vec![0u8; total_b];
-    pack_row(&codes, dim, mse_bits, &mut buf[..mse_row_b]);
-
-    let mut qjl_codes = vec![0u8; dim];
-    encode_qjl_signs(s, r.view(), &mut qjl_codes);
-    pack_row(&qjl_codes, dim, 1, &mut buf[mse_row_b..mse_row_b + qjl_row_b]);
-
-    buf[mse_row_b + qjl_row_b..].copy_from_slice(&gamma.to_le_bytes());
-    (norm, buf)
+    (norm, buf, codes)
 }
 
 fn topk_argmax_indices(scores: &[f32], k: usize) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..scores.len()).collect();
-    order.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]));
-    order.truncate(k);
-    order
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    /// Max-heap entry: **largest** [`Ord`] = **smallest** score → `peek` is the worst of the top‑`k`.
+    #[derive(Clone, Copy, Debug)]
+    struct Key(f32, usize);
+    impl PartialEq for Key {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 == other.0 && self.1 == other.1
+        }
+    }
+    impl Eq for Key {}
+    impl PartialOrd for Key {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Key {
+        fn cmp(&self, other: &Self) -> Ordering {
+            match self.0.total_cmp(&other.0) {
+                Ordering::Equal => self.1.cmp(&other.1),
+                o => o.reverse(),
+            }
+        }
+    }
+
+    let n = scores.len();
+    if k >= n {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+        return order;
+    }
+
+    let mut heap: BinaryHeap<Key> = BinaryHeap::with_capacity(k + 1);
+    for (i, &s) in scores.iter().enumerate() {
+        if heap.len() < k {
+            heap.push(Key(s, i));
+        } else if s > heap.peek().unwrap().0 {
+            heap.pop();
+            heap.push(Key(s, i));
+        }
+    }
+    let mut best: Vec<(f32, usize)> = heap.into_iter().map(|Key(s, i)| (s, i)).collect();
+    best.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    best.into_iter().map(|(_, i)| i).collect()
+}
+
+#[inline]
+fn q_rot_lut_row(q_rot_rows: &ndarray::Array2<f32>, qi: usize) -> &[f32] {
+    let dim = q_rot_rows.ncols();
+    let flat = q_rot_rows
+        .as_slice()
+        .expect("contiguous row-major rotated query matrix");
+    let start = qi * dim;
+    &flat[start..start + dim]
+}
+
+/// L2‑normalize each row **in place** and record per‑row norms in `norms_out` (length set to row count).
+fn normalize_rows_inplace_collect_norms(units: &mut ndarray::Array2<f32>, norms_out: &mut Vec<f32>) {
+    norms_out.resize(units.nrows(), 0.0_f32);
+    for (mut row, slot) in units.axis_iter_mut(Axis(0)).zip(norms_out.iter_mut()) {
+        let s = row.iter().fold(0f32, |acc, &x| acc + x * x).sqrt();
+        let denom = s.max(f32::MIN_POSITIVE);
+        *slot = s;
+        row.iter_mut().for_each(|x| *x /= denom);
+    }
+}
+
+#[cfg(test)]
+/// L2‑normalize each row **in place**; returns per‑row norms (parity tests).
+fn normalize_rows_inplace_ret_norms(units: &mut ndarray::Array2<f32>) -> Vec<f32> {
+    let mut norms = Vec::new();
+    normalize_rows_inplace_collect_norms(units, &mut norms);
+    norms
+}
+
+#[cfg(test)]
+/// All rotated unit queries: **`queries_unit @ rotationᵀ`** → **`(nq, dim)` row‑major** (each row matches per‑row [`rotated_unit_parts`]; contiguous rows for NEON LUT + BLAS).
+fn batch_rotated_unit_queries(
+    queries: ArrayView2<f32>,
+    rotation_mat: ndarray::ArrayView2<f32>,
+) -> (ndarray::Array2<f32>, Vec<f32>) {
+    assert_eq!(queries.ncols(), rotation_mat.nrows());
+    let nq = queries.nrows();
+    let dout = rotation_mat.ncols();
+    let mut units = queries.to_owned();
+    let norms = normalize_rows_inplace_ret_norms(&mut units);
+    let mut q_rot_rows = ndarray::Array2::<f32>::zeros((nq, dout));
+    general_mat_mul(1.0_f32, &units.view(), &rotation_mat.t(), 0.0_f32, &mut q_rot_rows.view_mut());
+    (q_rot_rows, norms)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qjl::apply_gaussian_matvec;
-    use ndarray::{Array1, ArrayView2, Axis};
+    use ndarray::{ArrayView2, Axis};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
     use rand_distr::{Distribution, StandardNormal};
@@ -461,8 +709,51 @@ mod tests {
     }
 
     #[test]
+    fn topk_heap_matches_full_sort() {
+        let mut rng = StdRng::seed_from_u64(404);
+        let dist = StandardNormal;
+        let scores: Vec<f32> = (0..5000)
+            .map(|_| {
+                let v: f64 = dist.sample(&mut rng);
+                v as f32
+            })
+            .collect();
+        for k in [1usize, 3, 10, 64, 256] {
+            let mut order: Vec<usize> = (0..scores.len()).collect();
+            order.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+            order.truncate(k);
+            let heap = topk_argmax_indices(&scores, k);
+            let mut exp: Vec<f32> = order.iter().map(|&i| scores[i]).collect();
+            let mut got: Vec<f32> = heap.iter().map(|&i| scores[i]).collect();
+            exp.sort_by(|a, b| b.total_cmp(a));
+            got.sort_by(|a, b| b.total_cmp(a));
+            assert_eq!(exp, got, "k={k}");
+        }
+    }
+
+    #[test]
+    fn batch_rotation_matches_per_row() {
+        use crate::rotation::random_orthogonal_matrix;
+        let d = 32;
+        let q =
+            ndarray::Array2::from_shape_fn((5, d), |(i, j)| ((i * 17 + j) as f32) * 0.01);
+        let rot = random_orthogonal_matrix(d, 9);
+        let (batch_r, norms_b) = batch_rotated_unit_queries(q.view(), rot.view());
+        for qi in 0..5 {
+            let row = q.index_axis(Axis(0), qi);
+            let (nref, rref) = rotated_unit_parts(row.as_slice().unwrap(), d, rot.view());
+            assert!((norms_b[qi] - nref).abs() < 1e-5);
+            for j in 0..d {
+                let a = batch_r[(qi, j)];
+                let b = rref[j];
+                assert!((a - b).abs() < 1e-4, "qi={qi} j={j} {a} {b}");
+            }
+        }
+    }
+
+    #[test]
     fn simd_wide_matches_scalar_scores() {
-        let dim = 24;
+        let dim = 20;
         let bits = 4u8;
         let mut rng = StdRng::seed_from_u64(303);
         let dist = StandardNormal;
@@ -518,11 +809,12 @@ mod tests {
             .fold(0f32, f32::max);
         assert!(max_diff < 1e-4, "{max_diff}");
     }
+
     #[test]
-    fn prod_simd_wide_matches_scalar_scores() {
-        let dim = 24;
+    fn decoded_lut_scores_match_packed() {
+        let dim = 20;
         let bits = 4u8;
-        let mut rng = StdRng::seed_from_u64(505);
+        let mut rng = StdRng::seed_from_u64(404);
         let dist = StandardNormal;
         let mut raw: Vec<f32> = Vec::with_capacity(40 * dim);
         for _ in 0..(40 * dim) {
@@ -534,89 +826,55 @@ mod tests {
         l2_normalize_rows(&mut db);
 
         let mut idx =
-            TurboQuantIndex::new_prod_with_lloyd_iterations(dim, bits, 77, 64);
+            TurboQuantIndex::with_lloyd_iterations(dim, bits, 77, 64);
         idx.add_vectors(db.view());
+
+        let mut flat = Vec::new();
+        unpack_all_rows(
+            idx.packed_codes(),
+            idx.len(),
+            dim,
+            bits,
+            idx.row_packed_bytes(),
+            &mut flat,
+        );
 
         let q = db.index_axis(Axis(0), 0).to_owned();
         let qrow = q.as_slice().unwrap();
         let (qnorm, q_rot) = rotated_unit_parts(qrow, dim, idx.rotation());
 
         let lut = crate::simd::flatten_query_lut(&q_rot, idx.centroids(), dim);
-        let mse_b = packed_row_bytes(dim, idx.mse_bits_per_coordinate());
-        let qjl_b = packed_row_bytes(dim, 1);
-        let s = idx.s_matrix().unwrap();
-        let unit_q = Array1::from_shape_fn(dim, |i| qrow[i] / qnorm.max(f32::MIN_POSITIVE));
-        let s_q = apply_gaussian_matvec(s, unit_q.view());
-        let s_q_sl = s_q.as_slice().unwrap();
-        let qjl_scale = crate::qjl::QJL_INVERSE_NUMERATOR / dim as f32;
 
-        let s_scalar = crate::simd::scores_for_query_prod(
+        let s_packed = crate::simd::scores_for_query(
             idx.packed_codes(),
             idx.norms(),
             dim,
-            idx.mse_bits_per_coordinate(),
-            mse_b,
-            qjl_b,
+            bits,
+            idx.len(),
             idx.row_packed_bytes(),
             &lut,
             idx.num_quant_levels(),
-            s_q_sl,
-            qjl_scale,
             qnorm,
             false,
             Scorer::Scalar,
         );
-        let s_wide = crate::simd::scores_for_query_prod(
-            idx.packed_codes(),
+        let s_dec = crate::simd::scores_for_query_decoded(
+            &flat,
             idx.norms(),
             dim,
-            idx.mse_bits_per_coordinate(),
-            mse_b,
-            qjl_b,
-            idx.row_packed_bytes(),
+            idx.len(),
             &lut,
             idx.num_quant_levels(),
-            s_q_sl,
-            qjl_scale,
             qnorm,
             false,
-            Scorer::Wide,
+            Scorer::Scalar,
         );
-        let max_diff = s_scalar
+        let max_diff = s_packed
             .iter()
-            .zip(&s_wide)
+            .zip(&s_dec)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(max_diff < 1e-4, "{max_diff}");
-    }
-
-    #[test]
-    fn prod_disk_roundtrip() {
-        let dim = 20;
-        let mut idx =
-            TurboQuantIndex::new_prod_with_lloyd_iterations(dim, 3, 4242, 50);
-        let mut rng = StdRng::seed_from_u64(2);
-        let dist = StandardNormal;
-        let mut raw: Vec<f32> = Vec::with_capacity(8 * dim);
-        for _ in 0..(8 * dim) {
-            let v: f64 = dist.sample(&mut rng);
-            raw.push(v as f32);
-        }
-        let mut db = ndarray::Array2::from_shape_vec((8, dim), raw).unwrap();
-        l2_normalize_rows(&mut db);
-        idx.add_vectors(db.view());
-
-        let mut path = std::env::temp_dir();
-        path.push("turboquant_prod_roundtrip_test.tq");
-        idx.write_disk(&path).unwrap();
-        let loaded = TurboQuantIndex::read_disk(&path).unwrap();
-        std::fs::remove_file(&path).ok();
-
-        assert!(loaded.is_prod_quantizer());
-        assert_eq!(idx.len(), loaded.len());
-        assert_eq!(idx.packed_codes(), loaded.packed_codes());
-        assert_eq!(idx.mse_bits_per_coordinate(), loaded.mse_bits_per_coordinate());
-        assert_eq!(idx.bits(), loaded.bits());
     }
 
     #[test]
